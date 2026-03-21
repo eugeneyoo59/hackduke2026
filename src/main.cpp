@@ -6,7 +6,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "model_data.h"
@@ -25,7 +25,7 @@ const int VOTE_WINDOW = 10;
 const int ALERT_COUNT = 6;
 
 // ── FSR pins ──────────────────────────────────────────────────────────────
-const int FSR_PINS[5] = {36, 39, 34, 35, 32};
+const int FSR_PINS[5] = {36, 39, 34, 35, 4};
 
 // ── Model settings ────────────────────────────────────────────────────────
 const int WINDOW_SIZE = 200;
@@ -34,6 +34,7 @@ const int N_CHANNELS = 3;
 // ── TFLite ────────────────────────────────────────────────────────────────
 constexpr int kTensorArenaSize = 30 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
+tflite::MicroMutableOpResolver<6> resolver;
 tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
 TfLiteTensor *output = nullptr;
@@ -64,12 +65,10 @@ class ServerCallbacks : public BLEServerCallbacks
   void onConnect(BLEServer *server)
   {
     ble_connected = true;
-    Serial.println("BLE client connected.");
   }
   void onDisconnect(BLEServer *server)
   {
     ble_connected = false;
-    Serial.println("BLE client disconnected. Restarting advertising...");
     BLEDevice::startAdvertising();
   }
 };
@@ -93,7 +92,6 @@ bool detect_fall(float ax, float ay, float az)
 {
   float mag = sqrt(ax * ax + ay * ay + az * az) / 9.81f;
   unsigned long now = millis();
-
   switch (fall_state)
   {
   case FALL_IDLE:
@@ -118,9 +116,7 @@ bool detect_fall(float ax, float ay, float az)
     }
     if (fall_state == FALL_FREEFALL &&
         now - fall_timer > IMPACT_WINDOW_MS)
-    {
       fall_state = FALL_IDLE;
-    }
     break;
   case FALL_IMPACT:
     if (mag > IMPACT_THRESHOLD)
@@ -129,9 +125,7 @@ bool detect_fall(float ax, float ay, float az)
       return true;
     }
     if (now - fall_timer > IMPACT_WINDOW_MS)
-    {
       fall_state = FALL_IDLE;
-    }
     break;
   }
   return false;
@@ -144,7 +138,7 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // Init BLE
+  // BLE
   BLEDevice::init("PD-Glove");
   ble_server = BLEDevice::createServer();
   ble_server->setCallbacks(new ServerCallbacks());
@@ -155,36 +149,39 @@ void setup()
           BLECharacteristic::PROPERTY_NOTIFY);
   ble_characteristic->addDescriptor(new BLE2902());
   service->start();
-  BLEAdvertising *advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(SERVICE_UUID);
-  advertising->start();
-  Serial.println("BLE advertising as 'PD-Glove'.");
+  BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
+  BLEDevice::startAdvertising();
 
-  // Init ICM20948
+  // ICM20948
   if (!icm.begin_I2C())
   {
-    Serial.println("ICM20948 not found! Check wiring.");
+    Serial.println("ICM20948 not found!");
     while (1)
       ;
   }
-  Serial.println("ICM20948 ready.");
   icm.setAccelRange(ICM20948_ACCEL_RANGE_4_G);
   icm.setAccelRateDivisor(4095);
 
   for (int i = 0; i < 5; i++)
     pinMode(FSR_PINS[i], INPUT);
 
-  // Load model
+  // TFLite — only ops actually used by the model
+  resolver.AddConv2D();
+  resolver.AddFullyConnected();
+  resolver.AddMean();
+  resolver.AddReshape();
+  resolver.AddExpandDims();
+  resolver.AddMaxPool2D();
+
   const tflite::Model *model = tflite::GetModel(pd_model);
   if (model->version() != TFLITE_SCHEMA_VERSION)
   {
-    Serial.println("Model schema mismatch!");
+    Serial.println("Schema mismatch!");
     while (1)
       ;
   }
 
   static tflite::MicroErrorReporter micro_error_reporter;
-  static tflite::AllOpsResolver resolver;
   static tflite::MicroInterpreter static_interpreter(
       model, resolver, tensor_arena, kTensorArenaSize,
       &micro_error_reporter);
@@ -199,7 +196,7 @@ void setup()
 
   input = interpreter->input(0);
   output = interpreter->output(0);
-  Serial.println("Model loaded. Ready.");
+  Serial.println("Ready.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -288,7 +285,7 @@ void loop()
 
   if (ble_connected)
   {
-    char json[256];
+    char json[200];
     snprintf(json, sizeof(json),
              "{\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
              "\"fsr\":[%d,%d,%d,%d,%d],"
@@ -300,7 +297,6 @@ void loop()
              fall_detected ? "true" : "false");
     ble_characteristic->setValue((uint8_t *)json, strlen(json));
     ble_characteristic->notify();
-    Serial.println(json);
   }
 
   unsigned long elapsed = millis() - start;
