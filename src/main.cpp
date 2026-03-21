@@ -6,7 +6,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "model_data.h"
@@ -34,7 +34,6 @@ const int N_CHANNELS = 3;
 // ── TFLite ────────────────────────────────────────────────────────────────
 constexpr int kTensorArenaSize = 30 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
-tflite::MicroMutableOpResolver<8> resolver;
 tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
 TfLiteTensor *output = nullptr;
@@ -169,26 +168,13 @@ void setup()
       ;
   }
   Serial.println("ICM20948 ready.");
-
-  // Set accelerometer range to ±4g — good for tremor detection
   icm.setAccelRange(ICM20948_ACCEL_RANGE_4_G);
-
-  // Set sample rate divider for ~100Hz
   icm.setAccelRateDivisor(4095);
 
   for (int i = 0; i < 5; i++)
     pinMode(FSR_PINS[i], INPUT);
 
-  // TFLite setup
-  resolver.AddConv2D();
-  resolver.AddDepthwiseConv2D();
-  resolver.AddFullyConnected();
-  resolver.AddMul();
-  resolver.AddAdd();
-  resolver.AddMean();
-  resolver.AddReshape();
-  resolver.AddSoftmax();
-
+  // Load model
   const tflite::Model *model = tflite::GetModel(pd_model);
   if (model->version() != TFLITE_SCHEMA_VERSION)
   {
@@ -198,6 +184,7 @@ void setup()
   }
 
   static tflite::MicroErrorReporter micro_error_reporter;
+  static tflite::AllOpsResolver resolver;
   static tflite::MicroInterpreter static_interpreter(
       model, resolver, tensor_arena, kTensorArenaSize,
       &micro_error_reporter);
@@ -265,17 +252,14 @@ void loop()
 {
   unsigned long start = millis();
 
-  // Read ICM20948
   icm.getEvent(&accel_event, &gyro_event, &temp_event, &mag_event);
 
   float ax = accel_event.acceleration.x;
   float ay = accel_event.acceleration.y;
   float az = accel_event.acceleration.z;
 
-  // Fall detection on every sample
   bool fall_detected = detect_fall(ax, ay, az);
 
-  // Fill ring buffer
   ring_buffer[buffer_index][0] = ax;
   ring_buffer[buffer_index][1] = ay;
   ring_buffer[buffer_index][2] = az;
@@ -287,12 +271,10 @@ void loop()
     buffer_filled = true;
   }
 
-  // Read FSR values
   int fsr[5];
   for (int i = 0; i < 5; i++)
     fsr[i] = analogRead(FSR_PINS[i]);
 
-  // PD inference every full window
   float risk_score = 0.0f;
   bool pd_alert = false;
 
@@ -304,7 +286,6 @@ void loop()
     digitalWrite(LED_PIN, pd_alert ? HIGH : LOW);
   }
 
-  // Send JSON over BLE
   if (ble_connected)
   {
     char json[256];
