@@ -32,7 +32,7 @@ const int WINDOW_SIZE = 200;
 const int N_CHANNELS = 3;
 
 // ── TFLite ────────────────────────────────────────────────────────────────
-constexpr int kTensorArenaSize = 30 * 1024;
+constexpr int kTensorArenaSize = 60 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
