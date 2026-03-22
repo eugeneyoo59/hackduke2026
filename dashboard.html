@@ -146,15 +146,12 @@ header h1 { font-size: 20px; font-weight: 500; color: #fff; }
 <script>
 const SERVICE_UUID        = "12345678-1234-1234-1234-123456789abc";
 const CHARACTERISTIC_UUID = "abcd1234-ab12-ab12-ab12-abcdef123456";
-const WINDOW_SIZE = 200;
-const N_CHANNELS  = 3;
-const THRESHOLD   = 0.4;
 const VOTE_WINDOW = 10;
 const ALERT_COUNT = 6;
 
-let modelWeights = null;
-let mean = null, std = null;
+let tmodel = null;
 let ringBuffer = [];
+let gravity = [0, 0, 0];
 let voteBuffer = new Array(VOTE_WINDOW).fill(0);
 let voteIdx = 0;
 let device = null;
@@ -162,115 +159,134 @@ let fallTimeout = null;
 
 async function loadModel() {
   try {
-    const resp = await fetch('model_weights.json');
-    const data = await resp.json();
-    mean = data.mean;
-    std  = data.std;
-    modelWeights = {};
-    for (const layer of data.weights) modelWeights[layer.name] = layer.weights;
-    document.getElementById('model-status').textContent = 'Model loaded — ready for inference';
+    const resp = await fetch('tremor_model.json');
+    tmodel = await resp.json();
+    document.getElementById('model-status').textContent =
+      `Model loaded — GBT ${tmodel.n_estimators} trees, ${tmodel.feature_names.length} features`;
     document.getElementById('model-status').style.color = '#22c55e';
-    addLog('Model weights loaded.', 'ok');
+    addLog('Tremor model loaded.', 'ok');
   } catch(e) {
     document.getElementById('model-status').textContent =
-      'ERROR: Could not load model_weights.json. Place it in the same folder as this file.';
+      'ERROR: Could not load tremor_model.json — place it in the same folder as this file.';
     document.getElementById('model-status').style.color = '#ef4444';
   }
 }
 
-function norm(v, ch) { return (v - mean[ch]) / std[ch]; }
-function relu(x) { return Math.max(0, x); }
-function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+function removeGravity(raw) {
+  const alpha = 0.98;
+  gravity[0] = alpha * gravity[0] + (1 - alpha) * raw[0];
+  gravity[1] = alpha * gravity[1] + (1 - alpha) * raw[1];
+  gravity[2] = alpha * gravity[2] + (1 - alpha) * raw[2];
+  return [raw[0] - gravity[0], raw[1] - gravity[1], raw[2] - gravity[2]];
+}
 
-function conv1d(input, T, Cin, kernel, Cout, K) {
-  const pad = Math.floor(K / 2);
-  const out = new Float32Array(T * Cout);
-  for (let t = 0; t < T; t++) {
-    for (let co = 0; co < Cout; co++) {
-      let s = 0;
-      for (let k = 0; k < K; k++) {
-        const t2 = t + k - pad;
-        if (t2 < 0 || t2 >= T) continue;
-        for (let ci = 0; ci < Cin; ci++) {
-          s += input[t2*Cin+ci] * kernel[k][ci][co];
-        }
+function fft(re, im) {
+  const n = re.length;
+  if (n <= 1) return;
+  const half = n >> 1;
+  const reE = new Float32Array(half), imE = new Float32Array(half);
+  const reO = new Float32Array(half), imO = new Float32Array(half);
+  for (let i = 0; i < half; i++) {
+    reE[i] = re[i*2]; imE[i] = im[i*2];
+    reO[i] = re[i*2+1]; imO[i] = im[i*2+1];
+  }
+  fft(reE, imE); fft(reO, imO);
+  for (let k = 0; k < half; k++) {
+    const angle = -2 * Math.PI * k / n;
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    const tr = cos * reO[k] - sin * imO[k];
+    const ti = sin * reO[k] + cos * imO[k];
+    re[k]        = reE[k] + tr; im[k]        = imE[k] + ti;
+    re[k + half] = reE[k] - tr; im[k + half] = imE[k] - ti;
+  }
+}
+
+function rfft_mag_sq(x, fs) {
+  let n = 1;
+  while (n < x.length) n <<= 1;
+  const re = new Float32Array(n);
+  const im = new Float32Array(n);
+  for (let i = 0; i < x.length; i++)
+    re[i] = x[i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (x.length - 1)));
+  fft(re, im);
+  const half = Math.floor(n / 2) + 1;
+  const mag  = new Float32Array(half);
+  for (let i = 0; i < half; i++) mag[i] = re[i]*re[i] + im[i]*im[i];
+  return { mag, freqRes: fs / n };
+}
+
+function extractFeatures(window) {
+  const T    = window.length;
+  const fs   = tmodel.sample_rate;
+  const tlo  = tmodel.tremor_lo;
+  const thi  = tmodel.tremor_hi;
+  const lolo = 0.5, lohi = tlo;
+  const hilo = thi, hihi = 15.0;
+  const eps  = 1e-10;
+  const features = [];
+  const tremorEnergies = [];
+
+  for (let axis = 0; axis < 3; axis++) {
+    const x = new Float32Array(T);
+    for (let i = 0; i < T; i++) x[i] = window[i][axis];
+    const { mag, freqRes } = rfft_mag_sq(x, fs);
+    let tremE = 0, lowE = 0, highE = 0, totalE = 0;
+    let maxPow = 0, domFreq = 0;
+    for (let i = 0; i < mag.length; i++) {
+      const f = i * freqRes;
+      if (f >= lolo && f <= hihi) {
+        totalE += mag[i];
+        if (f >= tlo  && f <= thi)  tremE += mag[i];
+        if (f >= lolo && f <  lohi) lowE  += mag[i];
+        if (f >= hilo && f <= hihi) highE += mag[i];
+        if (mag[i] > maxPow) { maxPow = mag[i]; domFreq = f; }
       }
-      out[t*Cout+co] = s;
     }
+    features.push(tremE, lowE, highE, tremE / (totalE + eps), domFreq);
+    tremorEnergies.push(tremE);
   }
-  return out;
-}
 
-function batchNorm(x, gamma, beta, movMean, movVar, eps=0.001) {
-  const C = gamma.length;
-  const out = new Float32Array(x.length);
-  for (let i = 0; i < x.length; i++) {
-    const c = i % C;
-    out[i] = gamma[c] * (x[i] - movMean[c]) / Math.sqrt(movVar[c] + eps) + beta[c];
+  features.push(tremorEnergies.reduce((a,b) => a+b, 0) / 3);
+
+  const mag_sig = new Float32Array(T);
+  for (let i = 0; i < T; i++) {
+    const ax = window[i][0], ay = window[i][1], az = window[i][2];
+    mag_sig[i] = Math.sqrt(ax*ax + ay*ay + az*az);
   }
-  return out;
+  const { mag: mfft, freqRes: mfr } = rfft_mag_sq(mag_sig, fs);
+  let mTotal = 0;
+  const valid = [];
+  for (let i = 0; i < mfft.length; i++) {
+    const f = i * mfr;
+    if (f >= lolo && f <= hihi) { valid.push(mfft[i] + eps); mTotal += mfft[i] + eps; }
+  }
+  let entropy = 0;
+  for (const v of valid) { const p = v / mTotal; entropy -= p * Math.log(p); }
+  features.push(entropy);
+
+  return features;
 }
 
-function reluArr(x) { return x.map(v => Math.max(0, v)); }
-
-function maxPool1D(x, T, C, pool=2) {
-  const Tout = Math.floor(T / pool);
-  const out  = new Float32Array(Tout * C);
-  for (let t = 0; t < Tout; t++)
-    for (let c = 0; c < C; c++) {
-      let m = -Infinity;
-      for (let p = 0; p < pool; p++) m = Math.max(m, x[(t*pool+p)*C+c]);
-      out[t*C+c] = m;
-    }
-  return out;
-}
-
-function globalAvgPool(x, T, C) {
-  const out = new Float32Array(C);
-  for (let t = 0; t < T; t++)
-    for (let c = 0; c < C; c++) out[c] += x[t*C+c];
-  return out.map(v => v / T);
+function predictTree(tree, features) {
+  let node = 0;
+  while (tree.children_left[node] !== -1) {
+    node = features[tree.feature[node]] <= tree.threshold[node]
+      ? tree.children_left[node]
+      : tree.children_right[node];
+  }
+  return tree.value[node];
 }
 
 function runInference(window) {
-  if (!modelWeights) return 0;
-
-  const inp = new Float32Array(WINDOW_SIZE * N_CHANNELS);
-  for (let i = 0; i < WINDOW_SIZE; i++)
-    for (let c = 0; c < N_CHANNELS; c++)
-      inp[i*N_CHANNELS+c] = norm(window[i][c], c);
-
-  const w = modelWeights;
-
-  let x = conv1d(inp, WINDOW_SIZE, 3, w['conv1d'][0], 16, 25);
-  x = batchNorm(x, w['batch_normalization'][0], w['batch_normalization'][1],
-                   w['batch_normalization'][2], w['batch_normalization'][3]);
-  x = reluArr(x);
-  x = maxPool1D(x, WINDOW_SIZE, 16);
-
-x = conv1d(x, 100, 16, w['conv1d_1'][0], 32, 10);
-  x = batchNorm(x, w['batch_normalization_1'][0], w['batch_normalization_1'][1],
-                   w['batch_normalization_1'][2], w['batch_normalization_1'][3]);
-  x = reluArr(x);
-  x = maxPool1D(x, 100, 32);
-
-  x = globalAvgPool(x, 50, 32);
-
-  const d1w = w['dense'][0];
-  const d1b = w['dense'][1];
-  const h = new Float32Array(32);
-  for (let n = 0; n < 32; n++) {
-    let s = d1b[n];
-    for (let k = 0; k < 32; k++) s += x[k] * d1w[k][n];
-    h[n] = relu(s);
-  }
-
-  const d2w = w['dense_1'][0];
-  const d2b = w['dense_1'][1];
-  let logit = d2b[0];
-  for (let k = 0; k < 32; k++) logit += h[k] * d2w[k][0];
-
-  return sigmoid(logit);
+  if (!tmodel) return 0;
+  const features = extractFeatures(window);
+  const scaled = features.map((f, i) =>
+    (f - tmodel.scaler_mean[i]) / (tmodel.scaler_std[i] + 1e-10)
+  );
+  let score = Math.log(tmodel.init_score / (1 - tmodel.init_score + 1e-10));
+  for (const tree of tmodel.trees)
+    score += tmodel.learning_rate * predictTree(tree, scaled);
+  return 1 / (1 + Math.exp(-score));
 }
 
 function majorityVote(isPD) {
@@ -280,10 +296,7 @@ function majorityVote(isPD) {
 }
 
 async function toggleConnect() {
-  if (device && device.gatt.connected) {
-    device.gatt.disconnect();
-    return;
-  }
+  if (device && device.gatt.connected) { device.gatt.disconnect(); return; }
   try {
     device = await navigator.bluetooth.requestDevice({
       filters: [{ name: 'PD-Glove' }],
@@ -296,9 +309,7 @@ async function toggleConnect() {
     await char.startNotifications();
     char.addEventListener('characteristicvaluechanged', onData);
     onConnected();
-  } catch(e) {
-    addLog('Connection failed: ' + e.message, '');
-  }
+  } catch(e) { addLog('Connection failed: ' + e.message, ''); }
 }
 
 function onConnected() {
@@ -340,13 +351,16 @@ function onData(event) {
       document.getElementById('fall-banner').classList.remove('show'), 4000);
   }
 
-  ringBuffer.push([d.ax, d.ay, d.az]);
-  if (ringBuffer.length > WINDOW_SIZE) ringBuffer.shift();
+  const linear = removeGravity([d.ax, d.ay, d.az]);
+  ringBuffer.push(linear);
+  const ws = tmodel ? tmodel.window_size : 400;
+  if (ringBuffer.length > ws) ringBuffer.shift();
 
-  if (ringBuffer.length === WINDOW_SIZE) {
+  if (ringBuffer.length === ws) {
     const prob  = runInference(ringBuffer);
     const risk  = prob * 100;
-    const alert = majorityVote(prob > THRESHOLD);
+    const thresh = tmodel ? tmodel.threshold : 0.4;
+    const alert = majorityVote(prob > thresh);
 
     const rv = document.getElementById('risk-val');
     const rb = document.getElementById('risk-bar');
@@ -354,21 +368,16 @@ function onData(event) {
     const rl = document.getElementById('risk-label');
 
     rv.textContent = risk.toFixed(1) + '%';
-    rb.style.width = risk + '%';
+    rb.style.width  = risk + '%';
 
     if (risk < 40) {
-      rv.className = 'big-value low';
-      rb.style.background = '#22c55e';
-      rl.textContent = 'Low risk';
-      rc.classList.remove('alert');
+      rv.className = 'big-value low'; rb.style.background = '#22c55e';
+      rl.textContent = 'Low risk'; rc.classList.remove('alert');
     } else if (risk < 65) {
-      rv.className = 'big-value mid';
-      rb.style.background = '#f59e0b';
-      rl.textContent = 'Moderate risk';
-      rc.classList.remove('alert');
+      rv.className = 'big-value mid'; rb.style.background = '#f59e0b';
+      rl.textContent = 'Moderate risk'; rc.classList.remove('alert');
     } else {
-      rv.className = 'big-value high';
-      rb.style.background = '#ef4444';
+      rv.className = 'big-value high'; rb.style.background = '#ef4444';
       rl.textContent = 'High risk';
     }
 

@@ -36,6 +36,7 @@ class ServerCallbacks : public BLEServerCallbacks
   {
     ble_connected = false;
     Serial.println("BLE disconnected.");
+    delay(500);
     BLEDevice::startAdvertising();
   }
 };
