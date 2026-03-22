@@ -107,10 +107,18 @@ header h1 { font-size: 20px; font-weight: 500; color: #fff; }
       <span id="status-text">Disconnected</span>
     </div>
   </div>
-  <button id="connect-btn" onclick="toggleConnect()">Connect to Glove</button>
+  <div style="display:flex;align-items:center;gap:10px">
+    <select id="model-select" onchange="switchModel(this.value)"
+      style="background:#13131a;color:#e0e0e0;border:1px solid #2a2a3a;
+             border-radius:8px;padding:9px 12px;font-size:13px;cursor:pointer">
+      <option value="tremor_model.json">Original model</option>
+      <option value="tremor_model2.json">New model (v2)</option>
+    </select>
+    <button id="connect-btn" onclick="toggleConnect()">Connect to Glove</button>
+  </div>
 </header>
 
-<div id="model-status">Model: loading model_weights.json...</div>
+<div id="model-status">Model: loading tremor_model.json...</div>
 
 <div id="pd-banner"   class="banner">PARKINSON'S RISK DETECTED</div>
 <div id="fall-banner" class="banner">FALL DETECTED</div>
@@ -160,21 +168,37 @@ let sampleCount = 0;
 let smoothedRisk = 0;
 const INFERENCE_EVERY = 400;
 
-async function loadModel() {
+// ── Model loader ─────────────────────────────────────────────────────────────
+async function loadModel(filename = 'tremor_model.json') {
+  const statusEl = document.getElementById('model-status');
+  statusEl.textContent = `Model: loading ${filename}...`;
+  statusEl.style.color = '#888';
   try {
-    const resp = await fetch('tremor_model.json');
+    const resp = await fetch(filename);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     tmodel = await resp.json();
-    document.getElementById('model-status').textContent =
-      `Model loaded — GBT ${tmodel.n_estimators} trees, ${tmodel.feature_names.length} features`;
-    document.getElementById('model-status').style.color = '#22c55e';
-    addLog('Tremor model loaded.', 'ok');
+    // Reset inference state when model changes
+    ringBuffer = []; voteBuffer = new Array(VOTE_WINDOW).fill(0);
+    voteIdx = 0; smoothedRisk = 0; sampleCount = 0;
+    document.getElementById('risk-val').textContent = '--';
+    document.getElementById('risk-label').textContent = 'waiting for data';
+    document.getElementById('risk-bar').style.width = '0%';
+    statusEl.textContent =
+      `Model loaded — ${filename} — GBT ${tmodel.n_estimators} trees, ${tmodel.feature_names.length} features`;
+    statusEl.style.color = '#22c55e';
+    addLog(`Loaded ${filename}`, 'ok');
   } catch(e) {
-    document.getElementById('model-status').textContent =
-      'ERROR: Could not load tremor_model.json — place it in the same folder as this file.';
-    document.getElementById('model-status').style.color = '#ef4444';
+    statusEl.textContent = `ERROR: Could not load ${filename} — ${e.message}`;
+    statusEl.style.color = '#ef4444';
+    addLog(`Failed to load ${filename}`, 'pd');
   }
 }
 
+function switchModel(filename) {
+  loadModel(filename);
+}
+
+// ── Gravity removal (IIR high-pass, α=0.98) ──────────────────────────────────
 function removeGravity(raw) {
   const alpha = 0.98;
   gravity[0] = alpha * gravity[0] + (1 - alpha) * raw[0];
@@ -183,6 +207,7 @@ function removeGravity(raw) {
   return [raw[0] - gravity[0], raw[1] - gravity[1], raw[2] - gravity[2]];
 }
 
+// ── FFT (Cooley-Tukey radix-2) ────────────────────────────────────────────────
 function fft(re, im) {
   const n = re.length;
   if (n <= 1) return;
@@ -209,6 +234,7 @@ function rfft_mag_sq(x, fs) {
   while (n < x.length) n <<= 1;
   const re = new Float32Array(n);
   const im = new Float32Array(n);
+  // Hann window
   for (let i = 0; i < x.length; i++)
     re[i] = x[i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (x.length - 1)));
   fft(re, im);
@@ -218,23 +244,31 @@ function rfft_mag_sq(x, fs) {
   return { mag, freqRes: fs / n };
 }
 
+// ── Feature extraction — 32 features (matches train_tremor_model.py) ──────────
+// Per axis (×3 = 27): tremor_energy, low_energy, high_energy, tremor_ratio,
+//   dominant_freq, rms, zcr, jerk_rms, autocorr_tremor
+// Global (5): mean_tremor_energy, magnitude_spectral_entropy,
+//   mean_inter_axis_corr, total_rms_magnitude, dominant_freq_magnitude
 function extractFeatures(window) {
-  const T    = window.length;
-  const fs   = tmodel.sample_rate;
-  const tlo  = tmodel.tremor_lo;
-  const thi  = tmodel.tremor_hi;
-  const lolo = 0.5, lohi = tlo;
-  const hilo = thi, hihi = 15.0;
-  const eps  = 1e-10;
+  const T     = window.length;
+  const fs    = tmodel.sample_rate;
+  const tlo   = tmodel.tremor_lo;
+  const thi   = tmodel.tremor_hi;
+  const lolo  = 0.5, lohi = tlo;
+  const hilo  = thi,  hihi = 15.0;
+  const fMid  = (tlo + thi) / 2;
+  const acLag = Math.max(1, Math.round(fs / fMid));
+  const eps   = 1e-10;
   const features = [];
   const tremorEnergies = [];
 
   for (let axis = 0; axis < 3; axis++) {
     const x = new Float32Array(T);
     for (let i = 0; i < T; i++) x[i] = window[i][axis];
+
+    // Spectral
     const { mag, freqRes } = rfft_mag_sq(x, fs);
-    let tremE = 0, lowE = 0, highE = 0, totalE = 0;
-    let maxPow = 0, domFreq = 0;
+    let tremE = 0, lowE = 0, highE = 0, totalE = 0, maxPow = 0, domFreq = 0;
     for (let i = 0; i < mag.length; i++) {
       const f = i * freqRes;
       if (f >= lolo && f <= hihi) {
@@ -245,31 +279,96 @@ function extractFeatures(window) {
         if (mag[i] > maxPow) { maxPow = mag[i]; domFreq = f; }
       }
     }
-    features.push(tremE, lowE, highE, tremE / (totalE + eps), domFreq);
+    const tremRatio = tremE / (totalE + eps);
+
+    // Time-domain
+    let sumSq = 0;
+    for (let i = 0; i < T; i++) sumSq += x[i] * x[i];
+    const rms = Math.sqrt(sumSq / T);
+
+    let zc = 0;
+    for (let i = 1; i < T; i++)
+      if (Math.sign(x[i]) !== Math.sign(x[i-1])) zc++;
+    const zcr = zc / (T - 1);
+
+    let jerkSumSq = 0;
+    for (let i = 1; i < T; i++) {
+      const d = (x[i] - x[i-1]) * fs;
+      jerkSumSq += d * d;
+    }
+    const jerkRms = Math.sqrt(jerkSumSq / (T - 1));
+
+    // Autocorrelation at tremor-band lag
+    let mean = 0;
+    for (let i = 0; i < T; i++) mean += x[i];
+    mean /= T;
+    const xc = new Float32Array(T);
+    let varSum = 0;
+    for (let i = 0; i < T; i++) { xc[i] = x[i] - mean; varSum += xc[i]*xc[i]; }
+    let acSum = 0;
+    if (varSum > eps && acLag < T)
+      for (let i = 0; i < T - acLag; i++) acSum += xc[i] * xc[i + acLag];
+    const autocorr = varSum > eps ? acSum / varSum : 0;
+
+    features.push(tremE, lowE, highE, tremRatio, domFreq,
+                  rms, zcr, jerkRms, autocorr);
     tremorEnergies.push(tremE);
   }
 
+  // Global: mean tremor energy
   features.push(tremorEnergies.reduce((a,b) => a+b, 0) / 3);
 
-  const mag_sig = new Float32Array(T);
+  // Global: magnitude spectral entropy
+  const magSig = new Float32Array(T);
   for (let i = 0; i < T; i++) {
-    const ax = window[i][0], ay = window[i][1], az = window[i][2];
-    mag_sig[i] = Math.sqrt(ax*ax + ay*ay + az*az);
+    const ax=window[i][0], ay=window[i][1], az=window[i][2];
+    magSig[i] = Math.sqrt(ax*ax + ay*ay + az*az);
   }
-  const { mag: mfft, freqRes: mfr } = rfft_mag_sq(mag_sig, fs);
+  const { mag: mfft, freqRes: mfr } = rfft_mag_sq(magSig, fs);
   let mTotal = 0;
   const valid = [];
   for (let i = 0; i < mfft.length; i++) {
     const f = i * mfr;
-    if (f >= lolo && f <= hihi) { valid.push(mfft[i] + eps); mTotal += mfft[i] + eps; }
+    if (f >= lolo && f <= hihi) { valid.push(mfft[i]+eps); mTotal += mfft[i]+eps; }
   }
   let entropy = 0;
-  for (const v of valid) { const p = v / mTotal; entropy -= p * Math.log(p); }
+  for (const v of valid) { const p = v/mTotal; entropy -= p*Math.log(p); }
   features.push(entropy);
 
-  return features;
+  // Global: mean inter-axis Pearson correlation
+  function pearson(ai, bi) {
+    let mx=0, my=0;
+    for (let i=0;i<T;i++){mx+=window[i][ai];my+=window[i][bi];}
+    mx/=T; my/=T;
+    let num=0, da=0, db=0;
+    for (let i=0;i<T;i++){
+      const a=window[i][ai]-mx, b=window[i][bi]-my;
+      num+=a*b; da+=a*a; db+=b*b;
+    }
+    return Math.sqrt(da)>eps && Math.sqrt(db)>eps ? num/Math.sqrt(da*db) : 0;
+  }
+  features.push((pearson(0,1) + pearson(0,2) + pearson(1,2)) / 3);
+
+  // Global: total RMS magnitude
+  let magSumSq = 0;
+  for (let i=0;i<T;i++){
+    const ax=window[i][0],ay=window[i][1],az=window[i][2];
+    magSumSq += ax*ax+ay*ay+az*az;
+  }
+  features.push(Math.sqrt(magSumSq/T));
+
+  // Global: dominant frequency of magnitude signal
+  let mMaxPow=0, mDomFreq=0;
+  for (let i=0;i<mfft.length;i++){
+    const f=i*mfr;
+    if (f>=lolo && f<=hihi && mfft[i]>mMaxPow){mMaxPow=mfft[i];mDomFreq=f;}
+  }
+  features.push(mDomFreq);
+
+  return features; // length 32
 }
 
+// ── GBT inference ─────────────────────────────────────────────────────────────
 function predictTree(tree, features) {
   let node = 0;
   while (tree.children_left[node] !== -1) {
@@ -282,8 +381,8 @@ function predictTree(tree, features) {
 
 function runInference(window) {
   if (!tmodel) return 0;
-  const features = extractFeatures(window);
-  const scaled = features.map((f, i) =>
+  const raw = extractFeatures(window);
+  const scaled = raw.map((f, i) =>
     (f - tmodel.scaler_mean[i]) / (tmodel.scaler_std[i] + 1e-10)
   );
   let score = Math.log(tmodel.init_score / (1 - tmodel.init_score + 1e-10));
@@ -292,12 +391,14 @@ function runInference(window) {
   return 1 / (1 + Math.exp(-score));
 }
 
+// ── Majority vote ─────────────────────────────────────────────────────────────
 function majorityVote(isPD) {
   voteBuffer[voteIdx] = isPD ? 1 : 0;
   voteIdx = (voteIdx + 1) % VOTE_WINDOW;
   return voteBuffer.reduce((a,b) => a+b, 0) >= ALERT_COUNT;
 }
 
+// ── BLE ───────────────────────────────────────────────────────────────────────
 async function toggleConnect() {
   if (device && device.gatt.connected) { device.gatt.disconnect(); return; }
   try {
@@ -331,6 +432,7 @@ function onDisconnected() {
   addLog('Disconnected.', '');
 }
 
+// ── Data handler ──────────────────────────────────────────────────────────────
 function onData(event) {
   const raw = new TextDecoder().decode(event.target.value);
   let d;
@@ -357,29 +459,29 @@ function onData(event) {
   const linear = removeGravity([d.ax, d.ay, d.az]);
   ringBuffer.push(linear);
   sampleCount++;
-  const ws = tmodel ? tmodel.window_size : 400;
+  const ws = tmodel ? tmodel.window_size : 128;
   if (ringBuffer.length > ws) ringBuffer.shift();
 
   if (ringBuffer.length === ws && sampleCount % INFERENCE_EVERY === 0) {
     const prob  = runInference(ringBuffer);
-    const risk = prob * 100;
-smoothedRisk = 0.7 * smoothedRisk + 0.3 * risk;
-const displayRisk = smoothedRisk;
-    const thresh = tmodel ? tmodel.threshold : 0.4;
-    const alert = majorityVote(prob > thresh);
+    const risk  = prob * 100;
+    smoothedRisk = 0.7 * smoothedRisk + 0.3 * risk;
+
+    const thresh = tmodel ? tmodel.threshold : 0.45;
+    const alert  = majorityVote(prob > thresh);
 
     const rv = document.getElementById('risk-val');
     const rb = document.getElementById('risk-bar');
     const rc = document.getElementById('risk-card');
     const rl = document.getElementById('risk-label');
 
-    rv.textContent = risk.toFixed(1) + '%';
-    rb.style.width  = risk + '%';
+    rv.textContent  = smoothedRisk.toFixed(1) + '%';
+    rb.style.width  = smoothedRisk + '%';
 
-    if (risk < 40) {
+    if (smoothedRisk < 40) {
       rv.className = 'big-value low'; rb.style.background = '#22c55e';
       rl.textContent = 'Low risk'; rc.classList.remove('alert');
-    } else if (risk < 65) {
+    } else if (smoothedRisk < 65) {
       rv.className = 'big-value mid'; rb.style.background = '#f59e0b';
       rl.textContent = 'Moderate risk'; rc.classList.remove('alert');
     } else {
@@ -390,15 +492,16 @@ const displayRisk = smoothedRisk;
     if (alert) {
       document.getElementById('pd-banner').classList.add('show');
       rc.classList.add('alert');
-      addLog("PARKINSON'S DETECTED — " + risk.toFixed(1) + '%', 'pd');
+      addLog("PARKINSON'S DETECTED — " + smoothedRisk.toFixed(1) + '%', 'pd');
     } else {
       document.getElementById('pd-banner').classList.remove('show');
     }
   }
 }
 
+// ── Log ───────────────────────────────────────────────────────────────────────
 function addLog(msg, type) {
-  const el = document.getElementById('log');
+  const el  = document.getElementById('log');
   const div = document.createElement('div');
   div.className = 'log-entry ' + type;
   div.textContent = new Date().toLocaleTimeString() + '  ' + msg;
@@ -406,7 +509,7 @@ function addLog(msg, type) {
   while (el.children.length > 60) el.removeChild(el.lastChild);
 }
 
-loadModel();
+loadModel('tremor_model.json');
 </script>
 </body>
 </html>
