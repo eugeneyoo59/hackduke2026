@@ -157,7 +157,8 @@ let voteIdx = 0;
 let device = null;
 let fallTimeout = null;
 let sampleCount = 0;
-const INFERENCE_EVERY = 200;
+let smoothedRisk = 0;
+const INFERENCE_EVERY = 400;
 
 async function loadModel() {
   try {
@@ -361,7 +362,9 @@ function onData(event) {
 
   if (ringBuffer.length === ws && sampleCount % INFERENCE_EVERY === 0) {
     const prob  = runInference(ringBuffer);
-    const risk  = prob * 100;
+    const risk = prob * 100;
+smoothedRisk = 0.7 * smoothedRisk + 0.3 * risk;
+const displayRisk = smoothedRisk;
     const thresh = tmodel ? tmodel.threshold : 0.4;
     const alert = majorityVote(prob > thresh);
 

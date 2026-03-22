@@ -128,7 +128,7 @@ void setup()
       ;
   }
   icm.setAccelRange(ICM20948_ACCEL_RANGE_4_G);
-  icm.setAccelRateDivisor(4095);
+  icm.setAccelRateDivisor(0);
   Serial.println("ICM20948 ready.");
 
   for (int i = 0; i < 5; i++)
