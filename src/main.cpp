@@ -6,7 +6,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "model_data.h"
@@ -34,7 +34,6 @@ const int N_CHANNELS = 3;
 // ── TFLite ────────────────────────────────────────────────────────────────
 constexpr int kTensorArenaSize = 30 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
-tflite::MicroMutableOpResolver<6> resolver;
 tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
 TfLiteTensor *output = nullptr;
@@ -151,6 +150,7 @@ void setup()
   service->start();
   BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
   BLEDevice::startAdvertising();
+  Serial.println("BLE ready.");
 
   // ICM20948
   if (!icm.begin_I2C())
@@ -161,18 +161,12 @@ void setup()
   }
   icm.setAccelRange(ICM20948_ACCEL_RANGE_4_G);
   icm.setAccelRateDivisor(4095);
+  Serial.println("ICM20948 ready.");
 
   for (int i = 0; i < 5; i++)
     pinMode(FSR_PINS[i], INPUT);
 
-  // TFLite — only ops actually used by the model
-  resolver.AddConv2D();
-  resolver.AddFullyConnected();
-  resolver.AddMean();
-  resolver.AddReshape();
-  resolver.AddExpandDims();
-  resolver.AddMaxPool2D();
-
+  // TFLite
   const tflite::Model *model = tflite::GetModel(pd_model);
   if (model->version() != TFLITE_SCHEMA_VERSION)
   {
@@ -182,6 +176,7 @@ void setup()
   }
 
   static tflite::MicroErrorReporter micro_error_reporter;
+  static tflite::AllOpsResolver resolver;
   static tflite::MicroInterpreter static_interpreter(
       model, resolver, tensor_arena, kTensorArenaSize,
       &micro_error_reporter);
@@ -196,7 +191,7 @@ void setup()
 
   input = interpreter->input(0);
   output = interpreter->output(0);
-  Serial.println("Ready.");
+  Serial.println("Model loaded. Ready.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
