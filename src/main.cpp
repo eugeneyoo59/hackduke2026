@@ -16,8 +16,8 @@
 #define CHARACTERISTIC_UUID "abcd1234-ab12-ab12-ab12-abcdef123456"
 
 // ── Normalization constants ───────────────────────────────────────────────
-const float MEAN[3] = {0.000437f, 0.001648f, 0.001794f};
-const float STD[3] = {0.036877f, 0.066766f, 0.060274f};
+const float MEAN[3] = {0.000294f, 0.001564f, 0.001676f};
+const float STD[3] = {0.028253f, 0.055107f, 0.046798f};
 const float THRESHOLD = 0.4f;
 
 // ── Voting ────────────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ const int VOTE_WINDOW = 10;
 const int ALERT_COUNT = 6;
 
 // ── FSR pins ──────────────────────────────────────────────────────────────
-const int FSR_PINS[5] = {36, 39, 34, 35, 4};
+const int FSR_PINS[5] = {36, 39, 34, 35, 15};
 
 // ── Model settings ────────────────────────────────────────────────────────
 const int WINDOW_SIZE = 200;
@@ -203,29 +203,21 @@ float normalize(float value, int channel)
 // ─────────────────────────────────────────────────────────────────────────
 float run_inference()
 {
-  int8_t *input_data = input->data.int8;
-  float input_scale = input->params.scale;
-  int input_zero_point = input->params.zero_point;
+  float *input_data = input->data.f;
 
   for (int i = 0; i < WINDOW_SIZE; i++)
   {
     int src = (buffer_index + i) % WINDOW_SIZE;
     for (int c = 0; c < N_CHANNELS; c++)
     {
-      float norm = normalize(ring_buffer[src][c], c);
-      int q = (int)(norm / input_scale) + input_zero_point;
-      q = max(-128, min(127, q));
-      input_data[i * N_CHANNELS + c] = (int8_t)q;
+      input_data[i * N_CHANNELS + c] = normalize(ring_buffer[src][c], c);
     }
   }
 
   if (interpreter->Invoke() != kTfLiteOk)
     return 0.0f;
 
-  int8_t raw = output->data.int8[0];
-  float scale = output->params.scale;
-  int zp = output->params.zero_point;
-  return (raw - zp) * scale;
+  return interpreter->output(0)->data.f[0];
 }
 
 // ─────────────────────────────────────────────────────────────────────────
