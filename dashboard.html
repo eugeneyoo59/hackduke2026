@@ -147,7 +147,7 @@ header h1 { font-size: 20px; font-weight: 500; color: #fff; }
 const SERVICE_UUID        = "12345678-1234-1234-1234-123456789abc";
 const CHARACTERISTIC_UUID = "abcd1234-ab12-ab12-ab12-abcdef123456";
 const VOTE_WINDOW = 10;
-const ALERT_COUNT = 6;
+const ALERT_COUNT = 8;
 
 let tmodel = null;
 let ringBuffer = [];
@@ -156,6 +156,8 @@ let voteBuffer = new Array(VOTE_WINDOW).fill(0);
 let voteIdx = 0;
 let device = null;
 let fallTimeout = null;
+let sampleCount = 0;
+const INFERENCE_EVERY = 200;
 
 async function loadModel() {
   try {
@@ -353,10 +355,11 @@ function onData(event) {
 
   const linear = removeGravity([d.ax, d.ay, d.az]);
   ringBuffer.push(linear);
+  sampleCount++;
   const ws = tmodel ? tmodel.window_size : 400;
   if (ringBuffer.length > ws) ringBuffer.shift();
 
-  if (ringBuffer.length === ws) {
+  if (ringBuffer.length === ws && sampleCount % INFERENCE_EVERY === 0) {
     const prob  = runInference(ringBuffer);
     const risk  = prob * 100;
     const thresh = tmodel ? tmodel.threshold : 0.4;
