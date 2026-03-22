@@ -242,13 +242,13 @@ function runInference(window) {
 
   const w = modelWeights;
 
-  let x = conv1d(inp, WINDOW_SIZE, 3, w['conv1d'], 16, 25);
+  let x = conv1d(inp, WINDOW_SIZE, 3, w['conv1d'][0], 16, 25);
   x = batchNorm(x, w['batch_normalization'][0], w['batch_normalization'][1],
                    w['batch_normalization'][2], w['batch_normalization'][3]);
   x = reluArr(x);
   x = maxPool1D(x, WINDOW_SIZE, 16);
 
-  x = conv1d(x, 100, 16, w['conv1d_1'], 32, 10);
+x = conv1d(x, 100, 16, w['conv1d_1'][0], 32, 10);
   x = batchNorm(x, w['batch_normalization_1'][0], w['batch_normalization_1'][1],
                    w['batch_normalization_1'][2], w['batch_normalization_1'][3]);
   x = reluArr(x);

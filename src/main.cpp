@@ -12,7 +12,7 @@
 
 // ── FSR pins ──────────────────────────────────────────────────────────────
 const int FSR_PINS[5] = {36, 39, 34, 35, 15};
-
+float gravity[3] = {0.0f, 0.0f, 0.0f};
 // ── LED ───────────────────────────────────────────────────────────────────
 const int LED_PIN = 2;
 
@@ -142,9 +142,17 @@ void loop()
 
   icm.getEvent(&accel_event, &gyro_event, &temp_event, &mag_event);
 
-  float ax = accel_event.acceleration.x;
-  float ay = accel_event.acceleration.y;
-  float az = accel_event.acceleration.z;
+  float raw_ax = accel_event.acceleration.x;
+  float raw_ay = accel_event.acceleration.y;
+  float raw_az = accel_event.acceleration.z;
+
+  gravity[0] = 0.98f * gravity[0] + 0.02f * raw_ax;
+  gravity[1] = 0.98f * gravity[1] + 0.02f * raw_ay;
+  gravity[2] = 0.98f * gravity[2] + 0.02f * raw_az;
+
+  float ax = raw_ax - gravity[0];
+  float ay = raw_ay - gravity[1];
+  float az = raw_az - gravity[2];
 
   bool fall = detect_fall(ax, ay, az);
 
